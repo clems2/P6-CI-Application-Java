@@ -15,6 +15,7 @@ COPY src src
 # de mon user Windows. Le cache mount accélère les
 # builds successifs en conservant le Gradle User Home.
 RUN --mount=type=cache,target=/root/.gradle \
+    sed -i 's/\r$//' gradlew && \
     chmod +x gradlew && \
     ./gradlew bootWar -x test --no-daemon
 

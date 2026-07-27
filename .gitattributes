@@ -1,0 +1,6 @@
+# Force LF sur les scripts shell, quel que soit l'OS
+*.sh text eol=lf
+gradlew text eol=lf
+
+# Fins de ligne par défaut normalisées
+* text=auto
