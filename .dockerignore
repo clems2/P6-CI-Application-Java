@@ -1,0 +1,26 @@
+# Artefacts de build (regénérés dans l'image)
+build
+.gradle
+src/main/java-generated
+
+# Git & IDE
+.git
+.gitignore
+.vscode
+.idea
+*.iml
+
+# Fichiers Docker
+Dockerfile
+.dockerignore
+
+# Secrets — ne JAMAIS envoyer dans le contexte de build
+.env
+
+# Hors périmètre exo 1
+k8s
+values.tpl.yaml
+
+# Divers
+*.log
+.DS_Store
