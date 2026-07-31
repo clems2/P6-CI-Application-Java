@@ -40,5 +40,8 @@ out/
 .openapi-generator/
 java-generated/
 
-#Environment variables secrets#
+# Environment variables secrets#
 .env
+
+# Rapports de tests normalises (generes par run-tests.py)
+/test-results
