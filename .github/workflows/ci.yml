@@ -1,0 +1,94 @@
+# ============================================================================
+# Workflow CI — P6 exercice 2, étape 2 (job de test)
+#
+# UN SEUL fichier, IDENTIQUE dans les deux repos (Angular et Java).
+# Il s'adapte automatiquement au projet en détectant un fichier marqueur
+# (angular.json -> Angular, gradlew -> Java), EXACTEMENT comme run-tests.py.
+# La "source de vérité" du type de projet est le système de fichiers du repo,
+# pas une variable déclarée : impossible de se désynchroniser.
+# ============================================================================
+
+name: CI
+
+# Déclencheurs : à chaque push et à chaque pull request, sur toutes les
+# branches. Permet de tester le workflow sur la branche de dev avant merge
+# (point de vigilance des consignes).
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # --- 1. Récupération du code -------------------------------------------
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      # --- 2. Détection du type de projet ------------------------------------
+      # On regarde quel marqueur est présent et on expose le résultat dans une
+      # variable de sortie (project_type) que les étapes suivantes consomment
+      # via leurs conditions `if`. Détection centralisée en un seul endroit.
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f "angular.json" ]; then
+            echo "project_type=angular" >> "$GITHUB_OUTPUT"
+            echo "Projet détecté : angular"
+          elif [ -f "gradlew" ]; then
+            echo "project_type=java" >> "$GITHUB_OUTPUT"
+            echo "Projet détecté : java"
+          else
+            echo "ERREUR : aucun marqueur de projet trouvé (angular.json ou gradlew)."
+            exit 1
+          fi
+
+      # --- 3a. Setup Node + cache npm (Angular uniquement) --------------------
+      # `cache: npm` met en cache le store npm entre les runs (critère fiche).
+      - name: Setup Node.js
+        if: steps.detect.outputs.project_type == 'angular'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # Chrome est nécessaire aux tests Karma headless (comme en local WSL).
+      - name: Installer Chrome
+        if: steps.detect.outputs.project_type == 'angular'
+        uses: browser-actions/setup-chrome@v1
+
+      # Installation des dépendances Angular. `npm ci` = versions exactes du
+      # lock-file (reproductible). Le script, lui, se contente de VÉRIFIER
+      # leur présence : l'installation est le rôle du pipeline.
+      - name: Installer les dépendances (Angular)
+        if: steps.detect.outputs.project_type == 'angular'
+        run: npm ci
+
+      # --- 3b. Setup JDK + cache Gradle (Java uniquement) --------------------
+      # `cache: gradle` met en cache les dépendances Gradle (critère fiche).
+      # Gradle télécharge lui-même ses deps : pas d'étape d'install séparée.
+      - name: Setup JDK 21
+        if: steps.detect.outputs.project_type == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      # --- 4. Exécution des tests via le script unifié ----------------------
+      # Le workflow a préparé l'environnement ; le script fait le reste
+      # (détecter, tester, normaliser les rapports, propager le code retour).
+      - name: Exécuter les tests
+        run: python3 run-tests.py
+
+      # --- 5. Publication du rapport JUnit comme artefact --------------------
+      # `if: always()` : on publie le rapport MÊME si les tests ont échoué,
+      # car c'est justement là qu'on veut pouvoir le consulter.
+      - name: Publier le rapport de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ steps.detect.outputs.project_type }}
+          path: test-results/
