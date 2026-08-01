@@ -1,0 +1,15 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i \"s/^version = '.*'/version = '${nextRelease.version}'/\" build.gradle",
+        "publishCmd": "docker pull ${process.env.IMAGE_NAME}:${process.env.SOURCE_TAG} && docker tag ${process.env.IMAGE_NAME}:${process.env.SOURCE_TAG} ${process.env.IMAGE_NAME}:${nextRelease.version} && docker push ${process.env.IMAGE_NAME}:${nextRelease.version}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}

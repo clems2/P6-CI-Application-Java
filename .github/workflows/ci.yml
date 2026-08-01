@@ -1,9 +1,11 @@
 # ============================================================================
-# Workflow CI — P6 exercice 2
+# Workflow CI/CD — P6 exercice 2
 #
 # UN SEUL fichier, IDENTIQUE dans les deux repos (Angular et Java).
-# Job test  : détecte le type de projet, lance run-tests.py, publie le rapport.
-# Job build : construit l'image Docker et la pousse sur GHCR (après les tests).
+# test    : détecte le type de projet, lance run-tests.py, publie le rapport.
+# build   : construit l'image Docker et la pousse sur GHCR (après les tests).
+# release : semantic-release — versionne, génère le changelog, crée la release
+#           GitHub. Réel sur `main`, dry-run (simulation) sur les autres branches.
 # ============================================================================
 
 name: CI
@@ -12,21 +14,20 @@ on:
   push:
   pull_request:
 
-# Permissions du GITHUB_TOKEN pour l'ensemble du workflow :
-#  - contents: read   -> checkout du code
-#  - packages: write  -> push de l'image vers GHCR (ghcr.io)
+# Permissions du GITHUB_TOKEN :
+#  - contents: write  -> créer des tags/releases (semantic-release) + checkout
+#  - packages: write  -> push de l'image vers GHCR
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
   # ==========================================================================
-  # JOB 1 — TEST (inchangé, déjà validé à l'étape 2)
+  # JOB 1 — TEST (inchangé)
   # ==========================================================================
   test:
     name: Test
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -79,29 +80,16 @@ jobs:
           path: test-results/
 
   # ==========================================================================
-  # JOB 2 — BUILD (nouveau, étape 3)
-  #
-  # Agnostique au langage : le `docker build` est identique pour les deux
-  # projets (toute la logique spécifique vit dans le Dockerfile). Aucune
-  # détection nécessaire ici.
+  # JOB 2 — BUILD (inchangé)
   # ==========================================================================
   build:
     name: Build & Push
     runs-on: ubuntu-latest
-    # Séquentiel : on ne build QUE si les tests passent. On ne publie jamais
-    # une image dont les tests sont cassés.
     needs: test
-
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      # --- Calcul des métadonnées d'image (nom + tag) -----------------------
-      # Nom de l'image = ghcr.io/<owner>/<repo>, forcé en minuscules (GHCR
-      # l'exige ; un nom de repo peut contenir des majuscules).
-      # Tag = <branche_nettoyée>-<sha_court> :
-      #   - branche nettoyée : les '/' (interdits dans un tag Docker) -> '-'
-      #   - sha court : 7 premiers caractères du SHA du commit
       - name: Préparer les métadonnées de l'image
         id: meta
         run: |
@@ -113,10 +101,6 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Image cible : ${IMAGE_NAME}:${TAG}"
 
-      # --- Authentification GHCR --------------------------------------------
-      # docker/login-action gère le token en entrée MASQUÉE : le GITHUB_TOKEN
-      # n'apparaît jamais en clair dans les logs. Token éphémère fourni par
-      # GitHub, détruit en fin de run (point de vigilance "protéger les secrets").
       - name: Connexion à GHCR
         uses: docker/login-action@v3
         with:
@@ -124,12 +108,64 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- Build + push de l'image ------------------------------------------
-      # docker/build-push-action construit à partir du Dockerfile à la racine
-      # et pousse l'image taguée vers GHCR.
       - name: Build et push de l'image Docker
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+# ==========================================================================
+  # JOB 3 — RELEASE (mis à jour : + re-tag Docker via exec)
+  # ==========================================================================
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      # Connexion à GHCR : nécessaire pour que exec puisse pull/push l'image
+      # au moment du re-tag sémantique.
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On recalcule les mêmes métadonnées que le job build, pour dire à exec
+      # QUELLE image re-taguer. IMAGE_NAME + SOURCE_TAG seront lus par exec
+      # via process.env.
+      - name: Préparer les métadonnées de l'image
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          BRANCH_CLEAN="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "SOURCE_TAG=${BRANCH_CLEAN}-${SHA_SHORT}" >> "$GITHUB_ENV"
+
+      - name: Lancer semantic-release (réel sur main, dry-run ailleurs)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "Branche main -> release réelle"
+            npx semantic-release
+          else
+            echo "Branche ${GITHUB_REF_NAME} -> dry-run (simulation)"
+            npx semantic-release --dry-run
+          fi
