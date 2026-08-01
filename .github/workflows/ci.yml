@@ -1,36 +1,36 @@
 # ============================================================================
-# Workflow CI — P6 exercice 2, étape 2 (job de test)
+# Workflow CI — P6 exercice 2
 #
 # UN SEUL fichier, IDENTIQUE dans les deux repos (Angular et Java).
-# Il s'adapte automatiquement au projet en détectant un fichier marqueur
-# (angular.json -> Angular, gradlew -> Java), EXACTEMENT comme run-tests.py.
-# La "source de vérité" du type de projet est le système de fichiers du repo,
-# pas une variable déclarée : impossible de se désynchroniser.
+# Job test  : détecte le type de projet, lance run-tests.py, publie le rapport.
+# Job build : construit l'image Docker et la pousse sur GHCR (après les tests).
 # ============================================================================
 
 name: CI
 
-# Déclencheurs : à chaque push et à chaque pull request, sur toutes les
-# branches. Permet de tester le workflow sur la branche de dev avant merge
-# (point de vigilance des consignes).
 on:
   push:
   pull_request:
 
+# Permissions du GITHUB_TOKEN pour l'ensemble du workflow :
+#  - contents: read   -> checkout du code
+#  - packages: write  -> push de l'image vers GHCR (ghcr.io)
+permissions:
+  contents: read
+  packages: write
+
 jobs:
+  # ==========================================================================
+  # JOB 1 — TEST (inchangé, déjà validé à l'étape 2)
+  # ==========================================================================
   test:
     name: Test
     runs-on: ubuntu-latest
 
     steps:
-      # --- 1. Récupération du code -------------------------------------------
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      # --- 2. Détection du type de projet ------------------------------------
-      # On regarde quel marqueur est présent et on expose le résultat dans une
-      # variable de sortie (project_type) que les étapes suivantes consomment
-      # via leurs conditions `if`. Détection centralisée en un seul endroit.
       - name: Détecter le type de projet
         id: detect
         run: |
@@ -45,8 +45,6 @@ jobs:
             exit 1
           fi
 
-      # --- 3a. Setup Node + cache npm (Angular uniquement) --------------------
-      # `cache: npm` met en cache le store npm entre les runs (critère fiche).
       - name: Setup Node.js
         if: steps.detect.outputs.project_type == 'angular'
         uses: actions/setup-node@v4
@@ -54,21 +52,14 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      # Chrome est nécessaire aux tests Karma headless (comme en local WSL).
       - name: Installer Chrome
         if: steps.detect.outputs.project_type == 'angular'
         uses: browser-actions/setup-chrome@v1
 
-      # Installation des dépendances Angular. `npm ci` = versions exactes du
-      # lock-file (reproductible). Le script, lui, se contente de VÉRIFIER
-      # leur présence : l'installation est le rôle du pipeline.
       - name: Installer les dépendances (Angular)
         if: steps.detect.outputs.project_type == 'angular'
         run: npm ci
 
-      # --- 3b. Setup JDK + cache Gradle (Java uniquement) --------------------
-      # `cache: gradle` met en cache les dépendances Gradle (critère fiche).
-      # Gradle télécharge lui-même ses deps : pas d'étape d'install séparée.
       - name: Setup JDK 21
         if: steps.detect.outputs.project_type == 'java'
         uses: actions/setup-java@v4
@@ -77,18 +68,68 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      # --- 4. Exécution des tests via le script unifié ----------------------
-      # Le workflow a préparé l'environnement ; le script fait le reste
-      # (détecter, tester, normaliser les rapports, propager le code retour).
       - name: Exécuter les tests
         run: python3 run-tests.py
 
-      # --- 5. Publication du rapport JUnit comme artefact --------------------
-      # `if: always()` : on publie le rapport MÊME si les tests ont échoué,
-      # car c'est justement là qu'on veut pouvoir le consulter.
       - name: Publier le rapport de test
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ steps.detect.outputs.project_type }}
           path: test-results/
+
+  # ==========================================================================
+  # JOB 2 — BUILD (nouveau, étape 3)
+  #
+  # Agnostique au langage : le `docker build` est identique pour les deux
+  # projets (toute la logique spécifique vit dans le Dockerfile). Aucune
+  # détection nécessaire ici.
+  # ==========================================================================
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    # Séquentiel : on ne build QUE si les tests passent. On ne publie jamais
+    # une image dont les tests sont cassés.
+    needs: test
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      # --- Calcul des métadonnées d'image (nom + tag) -----------------------
+      # Nom de l'image = ghcr.io/<owner>/<repo>, forcé en minuscules (GHCR
+      # l'exige ; un nom de repo peut contenir des majuscules).
+      # Tag = <branche_nettoyée>-<sha_court> :
+      #   - branche nettoyée : les '/' (interdits dans un tag Docker) -> '-'
+      #   - sha court : 7 premiers caractères du SHA du commit
+      - name: Préparer les métadonnées de l'image
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          BRANCH_CLEAN="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          TAG="${BRANCH_CLEAN}-${SHA_SHORT}"
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image cible : ${IMAGE_NAME}:${TAG}"
+
+      # --- Authentification GHCR --------------------------------------------
+      # docker/login-action gère le token en entrée MASQUÉE : le GITHUB_TOKEN
+      # n'apparaît jamais en clair dans les logs. Token éphémère fourni par
+      # GitHub, détruit en fin de run (point de vigilance "protéger les secrets").
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- Build + push de l'image ------------------------------------------
+      # docker/build-push-action construit à partir du Dockerfile à la racine
+      # et pousse l'image taguée vers GHCR.
+      - name: Build et push de l'image Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
