@@ -45,3 +45,5 @@ java-generated/
 
 # Rapports de tests normalises (generes par run-tests.py)
 /test-results
+# Node (outillage de release : semantic-release)
+node_modules/

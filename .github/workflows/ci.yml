@@ -1,36 +1,37 @@
 # ============================================================================
-# Workflow CI — P6 exercice 2, étape 2 (job de test)
+# Workflow CI/CD — P6 exercice 2
 #
 # UN SEUL fichier, IDENTIQUE dans les deux repos (Angular et Java).
-# Il s'adapte automatiquement au projet en détectant un fichier marqueur
-# (angular.json -> Angular, gradlew -> Java), EXACTEMENT comme run-tests.py.
-# La "source de vérité" du type de projet est le système de fichiers du repo,
-# pas une variable déclarée : impossible de se désynchroniser.
+# test    : détecte le type de projet, lance run-tests.py, publie le rapport.
+# build   : construit l'image Docker et la pousse sur GHCR (après les tests).
+# release : semantic-release — versionne, génère le changelog, crée la release
+#           GitHub. Réel sur `main`, dry-run (simulation) sur les autres branches.
 # ============================================================================
 
 name: CI
 
-# Déclencheurs : à chaque push et à chaque pull request, sur toutes les
-# branches. Permet de tester le workflow sur la branche de dev avant merge
-# (point de vigilance des consignes).
 on:
   push:
   pull_request:
 
+# Permissions du GITHUB_TOKEN :
+#  - contents: write  -> créer des tags/releases (semantic-release) + checkout
+#  - packages: write  -> push de l'image vers GHCR
+permissions:
+  contents: write
+  packages: write
+
 jobs:
+  # ==========================================================================
+  # JOB 1 — TEST (inchangé)
+  # ==========================================================================
   test:
     name: Test
     runs-on: ubuntu-latest
-
     steps:
-      # --- 1. Récupération du code -------------------------------------------
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      # --- 2. Détection du type de projet ------------------------------------
-      # On regarde quel marqueur est présent et on expose le résultat dans une
-      # variable de sortie (project_type) que les étapes suivantes consomment
-      # via leurs conditions `if`. Détection centralisée en un seul endroit.
       - name: Détecter le type de projet
         id: detect
         run: |
@@ -45,8 +46,6 @@ jobs:
             exit 1
           fi
 
-      # --- 3a. Setup Node + cache npm (Angular uniquement) --------------------
-      # `cache: npm` met en cache le store npm entre les runs (critère fiche).
       - name: Setup Node.js
         if: steps.detect.outputs.project_type == 'angular'
         uses: actions/setup-node@v4
@@ -54,21 +53,14 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      # Chrome est nécessaire aux tests Karma headless (comme en local WSL).
       - name: Installer Chrome
         if: steps.detect.outputs.project_type == 'angular'
         uses: browser-actions/setup-chrome@v1
 
-      # Installation des dépendances Angular. `npm ci` = versions exactes du
-      # lock-file (reproductible). Le script, lui, se contente de VÉRIFIER
-      # leur présence : l'installation est le rôle du pipeline.
       - name: Installer les dépendances (Angular)
         if: steps.detect.outputs.project_type == 'angular'
         run: npm ci
 
-      # --- 3b. Setup JDK + cache Gradle (Java uniquement) --------------------
-      # `cache: gradle` met en cache les dépendances Gradle (critère fiche).
-      # Gradle télécharge lui-même ses deps : pas d'étape d'install séparée.
       - name: Setup JDK 21
         if: steps.detect.outputs.project_type == 'java'
         uses: actions/setup-java@v4
@@ -77,18 +69,103 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      # --- 4. Exécution des tests via le script unifié ----------------------
-      # Le workflow a préparé l'environnement ; le script fait le reste
-      # (détecter, tester, normaliser les rapports, propager le code retour).
       - name: Exécuter les tests
         run: python3 run-tests.py
 
-      # --- 5. Publication du rapport JUnit comme artefact --------------------
-      # `if: always()` : on publie le rapport MÊME si les tests ont échoué,
-      # car c'est justement là qu'on veut pouvoir le consulter.
       - name: Publier le rapport de test
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ steps.detect.outputs.project_type }}
           path: test-results/
+
+  # ==========================================================================
+  # JOB 2 — BUILD (inchangé)
+  # ==========================================================================
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Préparer les métadonnées de l'image
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          BRANCH_CLEAN="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          TAG="${BRANCH_CLEAN}-${SHA_SHORT}"
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image cible : ${IMAGE_NAME}:${TAG}"
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build et push de l'image Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+# ==========================================================================
+  # JOB 3 — RELEASE (mis à jour : + re-tag Docker via exec)
+  # ==========================================================================
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      # Connexion à GHCR : nécessaire pour que exec puisse pull/push l'image
+      # au moment du re-tag sémantique.
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On recalcule les mêmes métadonnées que le job build, pour dire à exec
+      # QUELLE image re-taguer. IMAGE_NAME + SOURCE_TAG seront lus par exec
+      # via process.env.
+      - name: Préparer les métadonnées de l'image
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          BRANCH_CLEAN="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "SOURCE_TAG=${BRANCH_CLEAN}-${SHA_SHORT}" >> "$GITHUB_ENV"
+
+      - name: Lancer semantic-release (réel sur main, dry-run ailleurs)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "Branche main -> release réelle"
+            npx semantic-release
+          else
+            echo "Branche ${GITHUB_REF_NAME} -> dry-run (simulation)"
+            npx semantic-release --dry-run
+          fi
